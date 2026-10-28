@@ -1,0 +1,40 @@
+# Render Blueprint — deploys the GradeScan API.
+# Put this file at the ROOT of the Git repository that contains the contents of the `backend/` folder.
+# Render dashboard → New → Blueprint → pick the repo. Render then asks for the secrets marked
+# `sync: false` and generates APP_API_KEY for you (copy it from the service's Environment tab
+# into the app: Settings → Access key).
+services:
+  - type: web
+    name: gradescan-api
+    runtime: node
+    plan: free
+    region: frankfurt # closest to Egypt; cannot be changed after creation
+    buildCommand: npm ci --include=dev && npm run build
+    startCommand: npm start
+    healthCheckPath: /health
+    autoDeployTrigger: commit
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+      # Locks the API. Generated once by Render; the app must send the same value.
+      - key: APP_API_KEY
+        generateValue: true
+      # Free key from https://aistudio.google.com/apikey (reads the handwritten Arabic names)
+      - key: GEMINI_API_KEY
+        sync: false
+      # "Continue with Google": the OAuth client from Google Cloud Console (DEPLOY.md, step "Google sign-in").
+      # Lets every teacher save grades into their own sheet without sharing it with anyone.
+      - key: GOOGLE_OAUTH_CLIENT_ID
+        sync: false
+      - key: GOOGLE_OAUTH_CLIENT_SECRET
+        sync: false
+      # Optional alternative: whole service-account JSON on ONE line (see .env.example). Every sheet
+      # must then be shared with the service account's e-mail. Leave empty when using Google sign-in.
+      - key: GOOGLE_SERVICE_ACCOUNT_JSON
+        sync: false
+      - key: OCR_PROVIDER
+        value: gemini
+      # The free instance has 512 MB RAM — too little for the offline Tesseract engine, so report
+      # Gemini errors instead of crashing on the fallback.
+      - key: OCR_FALLBACK_TO_TESSERACT
+        value: "false"

@@ -1,6 +1,7 @@
 import sharp from 'sharp';
 import { convertArabicDigits } from './ocr.service';
-import type { ExtractedStudentResult, OcrLanguage } from './ocr.service';
+import { maxImagePixels } from './image-guard';
+import type { ExtractedNameResult, ExtractedStudentResult, OcrLanguage } from './ocr.service';
 
 /**
  * Gemini-based OCR for photographed grade sheets.
@@ -57,9 +58,14 @@ export class GeminiOcrError extends Error {
   }
 }
 
+/** 'grades' = names + marks (the grading scan), 'names' = names only (the attendance scan). */
+export type OcrMode = 'grades' | 'names';
+
 export interface GeminiOcrResult {
   rawText: string;
   extracted: ExtractedStudentResult[];
+  /** Names mode only: the names found on the attendance sheet. */
+  names: ExtractedNameResult[];
   model: string;
   droppedRows: number;
   /** Rows the model returned but we did not keep, with the reason — so nothing disappears silently. */
@@ -107,6 +113,29 @@ Respond with ONLY this JSON, no markdown and no commentary:
 {"rows":[{"name":"...","grade":0,"max_grade":0,"confidence":0.0}]}`;
 }
 
+export function buildNamesPrompt(lang: OcrLanguage): string {
+  const langHint =
+    lang === 'ara'
+      ? 'The student names on this sheet are written in Arabic (the list reads right-to-left).'
+      : lang === 'eng'
+        ? 'The student names on this sheet are written in English (the list reads left-to-right).'
+        : 'Student names may be in Arabic or English; keep each name in the script it is written in.';
+
+  return `You are a precise OCR engine reading a photographed ATTENDANCE sheet: a list or table with one student per row. ${langHint}
+
+Return the name of EVERY student on the page, top to bottom, as an object with:
+- "name": the student's full name exactly as written, in its original script. Do NOT translate, transliterate, shorten, reorder or "correct" the spelling, and keep every word of the name (Arabic names usually have 3-4 parts). Do not include row numbers, student IDs, tick marks, signatures, dates or "present/absent" words in the name.
+- "confidence": a number from 0 to 1 for how sure you are that the name was read correctly. Use a value below 0.6 whenever any letter is ambiguous (for example dots on Arabic letters that could be ب/ت/ث/ن/ي).
+
+Rules:
+- Return every name on the page. Whether a student is marked present, absent or left blank does not matter here — list them all.
+- Skip header rows, column titles, total rows, signatures, dates and empty rows.
+- Never invent names. If a name is partly illegible, give your best reading and lower the confidence.
+
+Respond with ONLY this JSON, no markdown and no commentary:
+{"rows":[{"name":"...","confidence":0.0}]}`;
+}
+
 /* ------------------------------------------------------------------ */
 /* Image preparation                                                   */
 /* ------------------------------------------------------------------ */
@@ -117,7 +146,7 @@ Respond with ONLY this JSON, no markdown and no commentary:
  * upload stays small and quick.
  */
 export async function prepareImageForGemini(input: Buffer): Promise<{ data: Buffer; mime: string }> {
-  const data = await sharp(input)
+  const data = await sharp(input, { limitInputPixels: maxImagePixels() })
     .rotate()
     .resize({ width: 2400, height: 2400, fit: 'inside', withoutEnlargement: true })
     .jpeg({ quality: 90 })
@@ -166,7 +195,7 @@ function cleanName(raw: unknown): string {
     .replace(BIDI_AND_ZW, '')
     .replace(TATWEEL, '')
     .replace(/[0-9٠-٩۰-۹]+/g, ' ') // stray serial numbers / IDs
-    .replace(/[|_=~"“”«»(){}[\]:;,،؛؟?!*#/\\<>+]/g, ' ')
+    .replace(/[|_=~"“”«»(){}[\]:;,،؛؟?!*#/\\<>+✓✔☑☐√×✗]/g, ' ')
     .replace(/\s+/g, ' ')
     .replace(/^[.\-' ]+|[.\-' ]+$/g, '')
     .trim();
@@ -175,9 +204,11 @@ function cleanName(raw: unknown): string {
 function toNumber(v: unknown): number | null {
   if (v === null || v === undefined || v === '') return null;
   if (typeof v === 'number') return Number.isFinite(v) ? v : null;
-  const s = convertArabicDigits(String(v)).replace(',', '.').replace(/[^\d.]/g, '');
-  if (!s) return null;
-  const n = parseFloat(s);
+  // The model should answer with a plain number, but may write "8/10", "17.5 points" or "-5". Take the FIRST
+  // number of the text (keeping its sign): stripping every non-digit used to turn "8/10" into 810 and "-5" into 5.
+  const m = convertArabicDigits(String(v)).replace(',', '.').match(/-?\d+(?:\.\d+)?/);
+  if (!m) return null;
+  const n = parseFloat(m[0]);
   return Number.isFinite(n) ? n : null;
 }
 
@@ -244,6 +275,40 @@ export function normalizeRows(json: any): {
   return { rows, dropped: droppedDetails.length, droppedDetails };
 }
 
+
+const ATTENDANCE_WORDS_RE =
+  /^(attendance|present|absent|status|signature|sign|signatures|check|checked|الحضور|حضور|الغياب|غياب|الحالة|التوقيع|توقيع|حاضر|غائب)$/i;
+
+/** Names-only counterpart of normalizeRows: the same cleaning, but no grade is needed. */
+export function normalizeNames(json: any): {
+  names: ExtractedNameResult[];
+  dropped: number;
+  droppedDetails: { name: string; reason: string }[];
+} {
+  const list: any[] = Array.isArray(json) ? json : Array.isArray(json?.rows) ? json.rows : Array.isArray(json?.names) ? json.names : [];
+  const names: ExtractedNameResult[] = [];
+  const droppedDetails: { name: string; reason: string }[] = [];
+
+  for (const item of list) {
+    // tolerate a bare string as well as {name, confidence}
+    const rawName = typeof item === 'string' ? item : item?.name;
+    const name = cleanName(rawName);
+    const letters = name.replace(/[\s.\-']/g, '');
+    const dropReason =
+      letters.length < 2 ? 'name too short'
+      : HEADER_OR_TOTAL.test(name) || ATTENDANCE_WORDS_RE.test(name) ? 'header or total row'
+      : null;
+    if (dropReason) {
+      droppedDetails.push({ name: name || String(rawName ?? '').trim(), reason: dropReason });
+      continue;
+    }
+    let confidence = toNumber(typeof item === 'string' ? null : item?.confidence);
+    confidence = confidence === null ? 0.7 : confidence > 1 ? confidence / 100 : confidence;
+    confidence = Math.max(0.05, Math.min(0.97, confidence));
+    names.push({ name, confidence });
+  }
+  return { names, dropped: droppedDetails.length, droppedDetails };
+}
 
 /* ------------------------------------------------------------------ */
 /* HTTP                                                                */
@@ -330,13 +395,17 @@ interface Outcome {
   text: string;
 }
 
-export async function recognizeWithGemini(image: Buffer, lang: OcrLanguage = 'auto'): Promise<GeminiOcrResult> {
+export async function recognizeWithGemini(
+  image: Buffer,
+  lang: OcrLanguage = 'auto',
+  mode: OcrMode = 'grades'
+): Promise<GeminiOcrResult> {
   const apiKey = process.env.GEMINI_API_KEY?.trim();
   if (!apiKey) throw new GeminiOcrError('GEMINI_API_KEY is not set', 'config');
 
   const prepared = await prepareImageForGemini(image);
   const imageB64 = prepared.data.toString('base64');
-  const prompt = buildPrompt(lang);
+  const prompt = mode === 'names' ? buildNamesPrompt(lang) : buildPrompt(lang);
   const makeBody = (jsonMode: boolean, thinkingLevel: string | null) => ({
     contents: [
       {
@@ -407,18 +476,38 @@ export async function recognizeWithGemini(image: Buffer, lang: OcrLanguage = 'au
           // opt-in: shows exactly what the model returned (contains student names — local debugging only)
           console.log(`[OCR][debug] ${model} raw response:\n${text.slice(0, 4000)}`);
         }
-        let parsed;
+        let parsed: {
+          rawText: string;
+          extracted: ExtractedStudentResult[];
+          names: ExtractedNameResult[];
+          dropped: number;
+          droppedDetails: { name: string; reason: string }[];
+        };
         try {
-          parsed = normalizeRows(extractJson(text));
+          const json = extractJson(text);
+          if (mode === 'names') {
+            const n = normalizeNames(json);
+            parsed = { rawText: n.names.map(x => x.name).join('\n'), extracted: [], names: n.names, dropped: n.dropped, droppedDetails: n.droppedDetails };
+          } else {
+            const g = normalizeRows(json);
+            parsed = {
+              rawText: g.rows.map(r => `${r.name}\t${r.grade}${r.maxGrade !== null ? `/${r.maxGrade}` : ''}`).join('\n'),
+              extracted: g.rows,
+              names: [],
+              dropped: g.dropped,
+              droppedDetails: g.droppedDetails,
+            };
+          }
         } catch (e: any) {
           fail(model, 'bad', `${e?.message ?? 'unreadable answer'} (after ${secs}s)`);
           return null;
         }
         coolingUntil.delete(model);
-        console.log(`[OCR] ${model}: ok in ${secs}s (image ${Math.round(prepared.data.length / 1024)} KB, thinking=${useThinking ? thinking : 'default'})`);
+        console.log(`[OCR] ${model}: ok in ${secs}s (mode=${mode}, image ${Math.round(prepared.data.length / 1024)} KB, thinking=${useThinking ? thinking : 'default'})`);
         return {
-          rawText: parsed.rows.map(r => `${r.name}\t${r.grade}${r.maxGrade !== null ? `/${r.maxGrade}` : ''}`).join('\n'),
-          extracted: parsed.rows,
+          rawText: parsed.rawText,
+          extracted: parsed.extracted,
+          names: parsed.names,
           model,
           droppedRows: parsed.dropped,
           droppedDetails: parsed.droppedDetails,

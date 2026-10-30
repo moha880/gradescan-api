@@ -1,76 +1,61 @@
 import { google, Auth } from 'googleapis';
 import fs from 'fs';
 import path from 'path';
-import { createUserAuth, isGoogleSignInConfigured } from './google-oauth.service';
 
 /**
- * Creates authenticated Google API credentials, in this order:
- *   1. the signed-in teacher ("Continue with Google" refresh token) — works on any sheet they can edit
- *   2. a user OAuth access token sent as `Authorization: Bearer` (older clients)
- *   3. the shared service account (service-account.json / GOOGLE_SERVICE_ACCOUNT_JSON); the sheet
- *      must be shared with its e-mail
+ * GradeScan reads and writes a teacher's sheet with the server's OWN Google account (a "service
+ * account", the robot). The teacher never gives GradeScan access to their Google account or to their
+ * other sheets: the robot can only open a sheet its owner shared with the robot's e-mail address.
+ * ("Continue with Google" in the app tells the app who the teacher is and carries the teacher's own per-file Drive
+ * permission, used only to create a new attendance sheet in their Drive; the robot is then added to that sheet.)
  */
-export function createGoogleAuth(accessToken?: string, refreshToken?: string): Auth.GoogleAuth | Auth.OAuth2Client {
-  if (refreshToken && isGoogleSignInConfigured()) {
-    return createUserAuth(refreshToken);
-  }
 
-  if (accessToken && accessToken !== 'mock_token') {
-    const oauth2 = new google.auth.OAuth2();
-    oauth2.setCredentials({ access_token: accessToken });
-    return oauth2;
+/** Thrown when the server has no service account yet: whoever runs the server has to add one (DEPLOY.md). */
+export class ServiceAccountMissingError extends Error {
+  constructor() {
+    super(
+      'Saving to Google Sheets is not set up on the server yet. Ask whoever runs the server to add the Google service account key (backend/service-account.json, see DEPLOY.md).'
+    );
+    this.name = 'ServiceAccountMissingError';
   }
+}
+
+function serviceAccountPath(): string {
+  return process.env.GOOGLE_SERVICE_ACCOUNT_PATH || path.join(process.cwd(), 'service-account.json');
+}
+
+/** Credentials of the server's service account (service-account.json / GOOGLE_SERVICE_ACCOUNT_JSON). */
+export function createGoogleAuth(): Auth.GoogleAuth {
+  // spreadsheets: read and write the sheets that were shared with the robot. (New attendance sheets are not
+  // made by the robot: they are created in the teacher's own Drive with the teacher's permission.)
+  const scopes = ['https://www.googleapis.com/auth/spreadsheets'];
 
   const jsonInline = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
-  const jsonPath =
-    process.env.GOOGLE_SERVICE_ACCOUNT_PATH ||
-    path.join(process.cwd(), 'service-account.json');
-
   if (jsonInline) {
-    const credentials = JSON.parse(jsonInline);
-    return new google.auth.GoogleAuth({
-      credentials,
-      scopes: ['https://www.googleapis.com/auth/spreadsheets'],
-    });
+    return new google.auth.GoogleAuth({ credentials: JSON.parse(jsonInline), scopes });
   }
 
+  const jsonPath = serviceAccountPath();
   if (fs.existsSync(jsonPath)) {
-    return new google.auth.GoogleAuth({
-      keyFile: jsonPath,
-      scopes: ['https://www.googleapis.com/auth/spreadsheets'],
-    });
+    return new google.auth.GoogleAuth({ keyFile: jsonPath, scopes });
   }
 
-  throw new Error(
-    isGoogleSignInConfigured()
-      ? 'Sign in with Google (Settings) to save grades to your sheet.'
-      : 'Google Sheets is not set up on the server. Set GOOGLE_OAUTH_CLIENT_ID / GOOGLE_OAUTH_CLIENT_SECRET ' +
-          '(teachers sign in with Google) or add a service-account.json and share the sheet with its e-mail.'
-  );
+  throw new ServiceAccountMissingError();
 }
 
-/** Whose credentials createGoogleAuth() will use — decides which error advice is right. */
-export function credentialMode(accessToken?: string, refreshToken?: string): 'user' | 'service' {
-  return (refreshToken && isGoogleSignInConfigured()) || (accessToken && accessToken !== 'mock_token') ? 'user' : 'service';
-}
-
-/** True when the server itself holds a Google identity (service account). Teachers may still sign in on top of that. */
+/** True when the server holds a service account (the app's Settings → TEST shows it). */
 export function hasGoogleCredentials(): boolean {
   if (process.env.GOOGLE_SERVICE_ACCOUNT_JSON) return true;
-  const jsonPath =
-    process.env.GOOGLE_SERVICE_ACCOUNT_PATH ||
-    path.join(process.cwd(), 'service-account.json');
-  return fs.existsSync(jsonPath);
+  return fs.existsSync(serviceAccountPath());
 }
 
+/** The e-mail address teachers share their sheet with (Editor). */
 export function getServiceAccountEmail(): string | null {
   try {
     if (process.env.GOOGLE_SERVICE_ACCOUNT_JSON) {
       return JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON).client_email ?? null;
     }
-    const jsonPath =
-      process.env.GOOGLE_SERVICE_ACCOUNT_PATH ||
-      path.join(process.cwd(), 'service-account.json');
+    const jsonPath = serviceAccountPath();
     if (fs.existsSync(jsonPath)) {
       return JSON.parse(fs.readFileSync(jsonPath, 'utf8')).client_email ?? null;
     }

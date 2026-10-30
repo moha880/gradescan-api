@@ -1,28 +1,25 @@
 import { Request, Response } from 'express';
-import { SyncService } from '../services/sync.service';
+import { MAX_SYNC_BATCH, SyncService } from '../services/sync.service';
 
 export class SyncController {
   private syncService = new SyncService();
 
   async processBatch(req: Request, res: Response) {
     try {
-      const { operations } = req.body;
+      // Express 5 leaves req.body undefined when the request has no JSON body
+      const { operations } = req.body ?? {};
       if (!operations || !Array.isArray(operations)) {
         return res.status(400).json({ error: 'Invalid payload' });
       }
-
-      let accessToken: string | undefined;
-      const authHeader = req.headers.authorization;
-      if (authHeader?.startsWith('Bearer ')) {
-        const token = authHeader.substring(7).trim();
-        if (token && token !== 'mock_token') accessToken = token;
+      if (operations.length > MAX_SYNC_BATCH) {
+        return res.status(413).json({ error: `Too many grades in one request (limit ${MAX_SYNC_BATCH}). Send them in smaller groups.` });
+      }
+      // every entry needs an id, otherwise the app cannot tell which grade a result belongs to
+      if (operations.some(op => !op || typeof op !== 'object' || typeof op.id !== 'string' || op.id === '' || op.id.length > 200)) {
+        return res.status(400).json({ error: 'Invalid payload: every operation needs an id.' });
       }
 
-      // "Continue with Google" sign-in from the app (see services/google-oauth.service.ts)
-      const refreshHeader = req.headers['x-google-refresh-token'];
-      const refreshToken = (Array.isArray(refreshHeader) ? refreshHeader[0] : refreshHeader)?.trim() || undefined;
-
-      const results = await this.syncService.processOperations(operations, accessToken, refreshToken);
+      const results = await this.syncService.processOperations(operations);
       return res.json({ success: true, results });
     } catch (error: any) {
       console.error('Batch error:', error);

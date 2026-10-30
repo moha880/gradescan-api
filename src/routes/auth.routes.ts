@@ -2,6 +2,8 @@ import { Router, Request, Response } from 'express';
 import {
   appendParams,
   buildAuthUrl,
+  checkState,
+  describeStateProblem,
   exchangeCode,
   getRedirectUri,
   GoogleSignInError,
@@ -46,7 +48,7 @@ authPageRouter.get('/start', (req: Request, res: Response) => {
   if (!isAllowedReturnUrl(returnUrl)) {
     return html(res, 400, 'Cannot sign in from here', 'Open this page from the GradeScan app (Settings → Continue with Google).');
   }
-  return res.redirect(buildAuthUrl(returnUrl));
+  return res.redirect(buildAuthUrl(returnUrl, undefined, { drive: req.query.drive === '1' }));
 });
 
 // 2. Google sends the browser here after the consent screen.
@@ -68,13 +70,56 @@ authPageRouter.get('/callback', async (req: Request, res: Response) => {
   if (typeof code !== 'string' || !code) return back({ error: 'Google did not send a sign-in code' }, 'Sign-in failed', 'Returning to GradeScan…');
 
   try {
-    const { refreshToken, email } = await exchangeCode(code);
-    console.log(`[auth] Google sign-in OK${email ? ` (${email})` : ''}`);
-    return back({ refresh_token: refreshToken, email: email ?? '' }, 'Signed in', email ? `Signed in as ${email}. Returning to GradeScan…` : 'Returning to GradeScan…');
+    const { refreshToken, email, name, driveGranted } = await exchangeCode(code);
+    console.log(`[auth] Google sign-in OK${email ? ` (${email})` : ''} [Drive ${driveGranted ? 'allowed' : 'NOT allowed: the teacher left the Drive box unticked'}]`);
+    return back({ refresh_token: refreshToken, email: email ?? '', name: name ?? '', drive_granted: driveGranted ? '1' : '' }, 'Signed in', email ? `Signed in as ${email}. Returning to GradeScan…` : 'Returning to GradeScan…');
   } catch (err: any) {
     const message = err instanceof GoogleSignInError ? err.message : 'Sign-in failed. Please try again.';
     console.warn(`[auth] Google sign-in failed: ${err?.message ?? err}`);
     return back({ error: message }, 'Sign-in failed', 'Returning to GradeScan…');
+  }
+});
+
+// App-facing sign-in (works with a hosted server AND with relay mode): the app asks for the Google
+// page address, opens it in the browser, and — in relay mode — sends the returned code back here.
+authApiRouter.get('/google/url', (req: Request, res: Response) => {
+  if (!isGoogleSignInConfigured()) {
+    return res.status(503).json({ error: 'This server is not set up for Google sign-in yet.' });
+  }
+  const returnUrl = req.query.return;
+  if (!isAllowedReturnUrl(returnUrl)) {
+    return res.status(400).json({ error: 'Invalid return link.' });
+  }
+  // optional second app link (Expo Go vs installed app); silently ignored when it is not an app link
+  const alt = isAllowedReturnUrl(req.query.alt) ? req.query.alt : undefined;
+  return res.json({ url: buildAuthUrl(returnUrl, alt, { drive: req.query.drive === '1' }), redirectUri: getRedirectUri() });
+});
+
+authApiRouter.post('/google/exchange', async (req: Request, res: Response) => {
+  if (!isGoogleSignInConfigured()) {
+    return res.status(503).json({ error: 'This server is not set up for Google sign-in yet.' });
+  }
+  const { code, state } = req.body ?? {};
+  const check = checkState(state);
+  if (!check.ok) {
+    // The state itself is never logged; the reason (and how stale it was) is what helps to trace a failure.
+    const stale = check.expiredForMs !== undefined ? `, ran out ${Math.round(check.expiredForMs / 1000)} s ago` : '';
+    const size = typeof state === 'string' ? `, ${state.length} characters` : `, received ${state === undefined ? 'nothing' : typeof state}`;
+    console.warn(`[auth] sign-in link refused: ${check.problem}${stale}${size}`);
+    return res.status(400).json({ error: describeStateProblem(check) });
+  }
+  if (typeof code !== 'string' || !code) {
+    return res.status(400).json({ error: 'Google did not send a sign-in code.' });
+  }
+  try {
+    const { refreshToken, email, name, driveGranted } = await exchangeCode(code);
+    console.log(`[auth] Google sign-in OK${email ? ` (${email})` : ''} [Drive ${driveGranted ? 'allowed' : 'NOT allowed: the teacher left the Drive box unticked'}]`);
+    return res.json({ refreshToken, email, name, driveGranted });
+  } catch (err: any) {
+    console.warn(`[auth] Google code exchange failed: ${err?.message ?? err}`);
+    return res
+      .status(err instanceof GoogleSignInError ? 400 : 502)
+      .json({ error: err instanceof GoogleSignInError ? err.message : 'Sign-in failed. Please try again.' });
   }
 });
 

@@ -2,6 +2,7 @@ import { createWorker, PSM } from 'tesseract.js';
 import sharp from 'sharp';
 import path from 'path';
 import fs from 'fs';
+import { maxImagePixels } from './image-guard';
 
 export interface ExtractedStudentResult {
   name: string;
@@ -12,6 +13,12 @@ export interface ExtractedStudentResult {
 }
 
 export type OcrLanguage = 'eng' | 'ara' | 'auto';
+
+/** A name read from an attendance sheet (no grade). */
+export interface ExtractedNameResult {
+  name: string;
+  confidence: number;
+}
 
 /* ------------------------------------------------------------------ */
 /* Text helpers                                                        */
@@ -107,6 +114,36 @@ export function parseRow(rawLine: string): { name: string; grade: number; maxGra
   if (HEADER_WORDS.test(name) || /^(total|average|sum|المجموع|المتوسط)\b/i.test(name)) return null;
 
   return { name, grade, maxGrade };
+}
+
+/** Words that head or close an attendance list; a line made only of these is not a student. */
+const ATTENDANCE_WORDS =
+  /^(#|no\.?|id|name|names|student|students|student name|attendance|present|absent|status|signature|sign|total|sum|date|page|class|م|الاسم|اسم|الأسماء|الطالب|اسم الطالب|الحضور|حضور|الغياب|غياب|الحالة|التوقيع|توقيع|المجموع|التاريخ)$/i;
+
+/**
+ * Offline fallback for the attendance mode: Tesseract's raw text → one name per line.
+ * Row numbers, tick marks, table borders and stray digits are dropped; what is left must look like a
+ * name (at least two letters, not a column title). Confidence is deliberately low so the review
+ * screen asks the teacher to confirm each one.
+ */
+export function namesFromRawText(rawText: string): ExtractedNameResult[] {
+  const out: ExtractedNameResult[] = [];
+  for (const rawLine of String(rawText ?? '').split(/\r?\n/)) {
+    const line = convertArabicDigits(rawLine.replace(BIDI_MARKS, ''))
+      .replace(/[|[\]{}()_=~“”"«»;:—–✓✔☑☐√×✗]+/g, ' ')
+      .replace(/(^|\s)\d+(?:[.,]\d+)?(?=\s|$)/g, ' ');
+    const name = cleanName(line);
+    const letters = name.replace(/[\s.\-']/g, '');
+    if (letters.length < 2) continue;
+    const words = name.split(' ');
+    if (ATTENDANCE_WORDS.test(name) || HEADER_WORDS.test(name)) continue;
+    // a whole line of column titles ("Name  Attendance", "الاسم الحضور")
+    if (words.every(w => ATTENDANCE_WORDS.test(w) || HEADER_WORDS.test(w))) continue;
+    // a line of only crumbs ("l i ll") is noise, not a name
+    if (!name.split(' ').some(t => t.replace(/[.\-']/g, '').length >= 2)) continue;
+    out.push({ name, confidence: 0.45 });
+  }
+  return out;
 }
 
 /* ------------------------------------------------------------------ */
@@ -210,11 +247,18 @@ export interface PreparedImage {
  * Phone photo → deskewed images with the table grid lines removed.
  * Shadows, noise and grid lines were the main reason Tesseract produced garbage.
  */
+/**
+ * The page is scaled to ~2000 px wide, which for a very tall, narrow picture used to mean a huge height
+ * (an 8 KB PNG became a ~1 GB working set in the integral image below). The height is capped, so the
+ * work stays bounded however odd the picture is; a normal page photo is not affected.
+ */
+export const MAX_PREPARED_HEIGHT = 6000;
+
 export async function preprocessImage(input: Buffer, refWidth = 2000): Promise<PreparedImage> {
-  let { data, info } = await sharp(input)
+  let { data, info } = await sharp(input, { limitInputPixels: maxImagePixels() })
     .rotate() // honour EXIF orientation
     .grayscale()
-    .resize({ width: refWidth })
+    .resize({ width: refWidth, height: MAX_PREPARED_HEIGHT, fit: 'inside' })
     .median(3)
     .normalise()
     .raw()
@@ -225,7 +269,7 @@ export async function preprocessImage(input: Buffer, refWidth = 2000): Promise<P
   if (Math.abs(skew) > 0.2) {
     const rotated = await sharp(data, { raw: { width: info.width, height: info.height, channels: 1 } })
       .rotate(-skew, { background: '#ffffff' })
-      .resize({ width: refWidth })
+      .resize({ width: refWidth, height: MAX_PREPARED_HEIGHT, fit: 'inside' })
       .toColourspace('b-w')
       .raw()
       .toBuffer({ resolveWithObject: true });
@@ -482,9 +526,7 @@ export class BackendOCRService {
 
   private getWorker(key: 'eng' | 'ara' | 'digits') {
     if (!this.workers.has(key)) {
-      this.workers.set(
-        key,
-        (async () => {
+      const created = (async () => {
           // Never mix eng+ara in one pass: on English sheets the Arabic model hallucinates
           // Arabic glyphs and bidi-reorders the line (grade and serial number swap places).
           const worker = await createWorker(key === 'ara' ? ['ara'] : ['eng'], 1, { langPath: getLangPath(), gzip: false, cacheMethod: 'none' });
@@ -496,8 +538,12 @@ export class BackendOCRService {
               : { tessedit_pageseg_mode: PSM.SINGLE_BLOCK, preserve_interword_spaces: '1' }
           );
           return worker;
-        })()
-      );
+        })();
+      // a failed start (missing language file, out of memory) must not be remembered: the next request tries again
+      created.catch(() => {
+        if (this.workers.get(key) === created) this.workers.delete(key);
+      });
+      this.workers.set(key, created);
     }
     return this.workers.get(key)!;
   }
@@ -512,6 +558,34 @@ export class BackendOCRService {
     const job = this.queue.then(() => this.recognizeNow(imageBufferOrBase64, lang));
     this.queue = job.catch(() => undefined);
     return job;
+  }
+
+  /** Attendance mode: just the text of the page (names), read row by row. */
+  recognizeText(imageBufferOrBase64: Buffer | string, lang: OcrLanguage = 'auto') {
+    const job = this.queue.then(() => this.recognizeTextNow(imageBufferOrBase64, lang));
+    this.queue = job.catch(() => undefined);
+    return job;
+  }
+
+  private async recognizeTextNow(imageBufferOrBase64: Buffer | string, lang: OcrLanguage): Promise<{ rawText: string }> {
+    const buffer =
+      typeof imageBufferOrBase64 === 'string'
+        ? Buffer.from(imageBufferOrBase64.replace(/^data:image\/\w+;base64,/, ''), 'base64')
+        : imageBufferOrBase64;
+    const prep = await preprocessImage(buffer);
+    const read = async (key: 'eng' | 'ara') => {
+      const data = await this.run(key, prep.textPng);
+      // how much real text did this language model find? (the wrong model reads noise with low confidence)
+      const score = collectWords(data).reduce(
+        (s, w) => s + (w.text.replace(/[^A-Za-z\u0600-\u06FF]/g, '').length >= 3 ? w.conf : 0),
+        0
+      );
+      return { rawText: ((data.text as string) || '').trim(), score };
+    };
+    if (lang === 'eng' || lang === 'ara') return { rawText: (await read(lang)).rawText };
+    const e = await read('eng');
+    const a = await read('ara');
+    return { rawText: (a.score > e.score ? a : e).rawText };
   }
 
   private async recognizeNow(

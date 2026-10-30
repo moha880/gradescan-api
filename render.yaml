@@ -22,14 +22,15 @@ services:
       # Free key from https://aistudio.google.com/apikey (reads the handwritten Arabic names)
       - key: GEMINI_API_KEY
         sync: false
-      # "Continue with Google": the OAuth client from Google Cloud Console (DEPLOY.md, step "Google sign-in").
-      # Lets every teacher save grades into their own sheet without sharing it with anyone.
+      # "Continue with Google": the OAuth client from Google Cloud Console (DEPLOY.md, Part 3). It identifies the
+      # teacher (name, e-mail) and, on the same page, asks for the per-file drive.file permission that lets the
+      # attendance mode create its sheet in the teacher's own Drive.
       - key: GOOGLE_OAUTH_CLIENT_ID
         sync: false
       - key: GOOGLE_OAUTH_CLIENT_SECRET
         sync: false
-      # Optional alternative: whole service-account JSON on ONE line (see .env.example). Every sheet
-      # must then be shared with the service account's e-mail. Leave empty when using Google sign-in.
+      # REQUIRED for saving grades and ticking attendance: the whole service-account ("robot") JSON on ONE
+      # line (see .env.example; DEPLOY.md, Part 2). Teachers share their sheet with the robot's e-mail as Editor.
       - key: GOOGLE_SERVICE_ACCOUNT_JSON
         sync: false
       - key: OCR_PROVIDER

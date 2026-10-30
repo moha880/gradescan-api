@@ -1,8 +1,17 @@
-import { backendOcrService } from './ocr.service';
-import type { ExtractedStudentResult, OcrLanguage } from './ocr.service';
+import { backendOcrService, namesFromRawText } from './ocr.service';
+import type { ExtractedNameResult, ExtractedStudentResult, OcrLanguage } from './ocr.service';
 import { GeminiOcrError, getGeminiModels, isGeminiConfigured, recognizeWithGemini } from './gemini-ocr.service';
 
 export type OcrProviderName = 'gemini' | 'tesseract';
+
+export interface NamesOutcome {
+  rawText: string;
+  names: ExtractedNameResult[];
+  provider: OcrProviderName;
+  model?: string;
+  fallbackReason?: string;
+  warnings: string[];
+}
 
 export interface OcrOutcome {
   rawText: string;
@@ -54,7 +63,8 @@ export class OcrManager {
       try {
         const res = await recognizeWithGemini(buffer, lang);
         const warnings: string[] = [];
-        if (res.droppedRows > 0) warnings.push(`${res.droppedRows} row(s) without a readable grade were skipped`);
+        for (const d of res.droppedDetails.slice(0, 5)) warnings.push(`Skipped "${d.name}": ${d.reason}`);
+        if (res.droppedDetails.length > 5) warnings.push(`…and ${res.droppedDetails.length - 5} more skipped rows`);
         console.log(`[OCR] provider=gemini model=${res.model} lang=${lang} extracted=${res.extracted.length} dropped=${res.droppedRows}`);
         return { rawText: res.rawText, extracted: res.extracted, provider: 'gemini', model: res.model, warnings };
       } catch (err: any) {
@@ -65,6 +75,39 @@ export class OcrManager {
       }
     }
     return this.runTesseract(buffer, lang, reason);
+  }
+
+  /** Attendance scan: only the names on the page (no grades needed). */
+  async recognizeNames(image: Buffer | string, lang: OcrLanguage = 'auto'): Promise<NamesOutcome> {
+    const buffer = toBuffer(image);
+    const { provider, reason } = getConfiguredProvider();
+
+    if (provider === 'gemini') {
+      try {
+        const res = await recognizeWithGemini(buffer, lang, 'names');
+        const warnings: string[] = [];
+        for (const d of res.droppedDetails.slice(0, 5)) warnings.push(`Skipped "${d.name}": ${d.reason}`);
+        if (res.droppedDetails.length > 5) warnings.push(`…and ${res.droppedDetails.length - 5} more skipped rows`);
+        console.log(`[OCR] provider=gemini mode=names model=${res.model} lang=${lang} names=${res.names.length} dropped=${res.droppedRows}`);
+        return { rawText: res.rawText, names: res.names, provider: 'gemini', model: res.model, warnings };
+      } catch (err: any) {
+        const msg = err instanceof GeminiOcrError ? err.message : `Gemini failed: ${err?.message ?? err}`;
+        console.warn(`[OCR] Gemini failed: ${msg}`);
+        if (process.env.OCR_FALLBACK_TO_TESSERACT === 'false') throw new Error(msg);
+        return this.runTesseractNames(buffer, lang, msg);
+      }
+    }
+    return this.runTesseractNames(buffer, lang, reason);
+  }
+
+  private async runTesseractNames(buffer: Buffer, lang: OcrLanguage, fallbackReason?: string): Promise<NamesOutcome> {
+    const res = await backendOcrService.recognizeText(buffer, lang);
+    const names = namesFromRawText(res.rawText);
+    const warnings = fallbackReason
+      ? ['Used the offline Tesseract engine, which is much less accurate on handwritten Arabic. Check every name.']
+      : [];
+    console.log(`[OCR] provider=tesseract mode=names lang=${lang} names=${names.length}`);
+    return { rawText: res.rawText, names, provider: 'tesseract', fallbackReason, warnings };
   }
 
   private async runTesseract(buffer: Buffer, lang: OcrLanguage, fallbackReason?: string): Promise<OcrOutcome> {
